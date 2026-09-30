@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Manifest WA Automation SaaS Engine</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #0b1320; color: #e2e8f0; margin: 0; padding: 20px; }
+    .container { max-width: 600px; margin: 0 auto; }
+    h1 { color: #25d366; font-size: 20px; margin-bottom: 4px; }
+    p.subtitle { color: #94a3b8; font-size: 12px; margin-top: 0; margin-bottom: 24px; }
+    .card { background-color: #162032; border: 1px solid #1e293b; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+    .card-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; color: #f8fafc; }
+    .input-group { display: flex; gap: 8px; margin-bottom: 8px; }
+    input, textarea { width: 100%; background: #0b1320; border: 1px solid #334155; color: #fff; padding: 10px; border-radius: 6px; font-size: 13px; box-sizing: border-box; }
+    button { background: #059669; color: white; border: none; padding: 10px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+    button:disabled { background: #334155; cursor: not-allowed; }
+    .btn-blue { background: #4f46e5; }
+    .code-display { background: #0f172a; border: 1px dashed #10b981; color: #34d399; font-size: 22px; font-weight: bold; letter-spacing: 4px; text-align: center; padding: 12px; margin-top: 10px; border-radius: 6px; display: none; }
+    .status-msg { font-size: 12px; margin-top: 8px; color: #cbd5e1; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Manifest WA Automation SaaS Engine</h1>
+    <p class="subtitle">Device Pairing & Bulk Campaign Dispatcher</p>
+
+    <div class="card">
+      <div class="card-title">1. Link WhatsApp Account</div>
+      <div class="input-group">
+        <input type="text" id="phone" placeholder="Sender Phone (e.g., 2348012345678)">
+        <button id="pairBtn" onclick="requestPairingCode()">Get Pairing Code</button>
+      </div>
+      <div id="pairingCodeBox" class="code-display"></div>
+      <div id="pairStatus" class="status-msg"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">2. Admin VIP Authorization</div>
+      <div class="input-group">
+        <input type="text" id="vipPhone" placeholder="Phone Number to Grant VIP">
+        <button class="btn-blue" onclick="grantVip()">Grant Unlimited Credits</button>
+      </div>
+      <div id="vipStatus" class="status-msg"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">3. Campaign Message Dispatcher</div>
+      <div style="margin-bottom: 8px;">
+        <input type="text" id="targetPhones" placeholder="Target Phone Numbers (Comma separated, e.g., 2348011112222, 2348033334444)">
+      </div>
+      <div style="margin-bottom: 8px;">
+        <textarea id="campaignMsg" rows="3" placeholder="Message template with Spintax support: {Hello|Hi|Greetings} customer!"></textarea>
+      </div>
+      <button style="width: 100%;" onclick="launchCampaign()">Launch Campaign</button>
+      <div id="campaignStatus" class="status-msg"></div>
+    </div>
+  </div>
+
+  <script>
+    async function requestPairingCode() {
+      const phone = document.getElementById('phone').value.trim();
+      const btn = document.getElementById('pairBtn');
+      const codeBox = document.getElementById('pairingCodeBox');
+      const status = document.getElementById('pairStatus');
+
+      if (!phone) return alert('Please enter a phone number');
+
+      btn.disabled = true;
+      btn.innerText = 'Requesting...';
+      codeBox.style.display = 'none';
+      status.innerText = 'Initializing socket connection... please wait 3 seconds.';
+
+      try {
+        const res = await fetch('/api/session/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone, usePairingCode: true })
+        });
+        const data = await res.json();
+
+        if (data.pairingCode) {
+          codeBox.innerText = data.pairingCode;
+          codeBox.style.display = 'block';
+          status.innerText = 'Enter this pairing code in WhatsApp: Linked Devices -> Link with Phone Number.';
+        } else if (data.message) {
+          status.innerText = data.message;
+        } else if (data.error) {
+          status.innerText = 'Error: ' + data.error;
+        }
+      } catch (err) {
+        status.innerText = 'Failed to communicate with server: ' + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.innerText = 'Get Pairing Code';
+      }
+    }
+
+    async function grantVip() {
+      const phone = document.getElementById('vipPhone').value.trim();
+      const status = document.getElementById('vipStatus');
+      if (!phone) return alert('Enter phone number');
+
+      try {
+        const res = await fetch('/api/admin/grant-vip', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone })
+        });
+        const data = await res.json();
+        status.innerText = data.message || data.error;
+      } catch (err) {
+        status.innerText = 'Error: ' + err.message;
+      }
+    }
+
+    async function launchCampaign() {
+      const senderPhone = document.getElementById('phone').value.trim();
+      const targets = document.getElementById('targetPhones').value.split(',').map(s => s.trim()).filter(Boolean);
+      const message = document.getElementById('campaignMsg').value.trim();
+      const status = document.getElementById('campaignStatus');
+
+      if (!senderPhone || targets.length === 0 || !message) {
+        return alert('Please fill in sender phone, target numbers, and message content.');
+      }
+
+      try {
+        const res = await fetch('/api/campaign/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ senderPhone, targets, message })
+        });
+        const data = await res.json();
+        status.innerText = data.message || data.error;
+      } catch (err) {
+        status.innerText = 'Error: ' + err.message;
+      }
+    }
+  </script>
+</body>
+</html>
