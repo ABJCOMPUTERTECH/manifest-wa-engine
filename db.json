@@ -1,0 +1,12 @@
+{
+  "users": [
+    {
+      "phone": "2348163883487",
+      "is_free": 1,
+      "subscription_expiry": null,
+      "is_vip": true,
+      "credits": 999999
+    }
+  ],
+  "promo_codes": []
+}

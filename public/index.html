@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Automation Suite</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen pb-12 font-sans antialiased">
+
+    <!-- Top Navigation Header -->
+    <header class="bg-slate-900 border-b border-slate-800 px-4 py-3 sticky top-0 z-50">
+        <div class="max-w-md mx-auto flex justify-between items-center">
+            <div class="flex items-center space-x-2">
+                <div class="bg-emerald-500/10 p-2 rounded-lg text-emerald-400">
+                    <i class="fa-brands fa-whatsapp text-xl"></i>
+                </div>
+                <span class="font-bold text-lg tracking-wide text-white">BroadcastEngine</span>
+            </div>
+            <div id="status-badge" class="px-3 py-1 rounded-full text-xs font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20 flex items-center space-x-1.5">
+                <span class="w-2 h-2 rounded-full bg-rose-500 animate-pulse"></span>
+                <span id="status-text">DISCONNECTED</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-md mx-auto px-4 mt-5 space-y-5">
+
+        <!-- Connection Card -->
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl">
+            <div class="flex items-center justify-between mb-3">
+                <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider">Device Connection</h2>
+                <i class="fa-solid fa-mobile-screen text-slate-500"></i>
+            </div>
+            
+            <div class="space-y-3">
+                <div>
+                    <label class="text-xs text-slate-400 font-medium">WhatsApp Phone Number</label>
+                    <input type="tel" id="phone-num" placeholder="e.g. 2348012345678" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-emerald-500 transition text-slate-100 mt-1 placeholder-slate-600">
+                </div>
+                
+                <button onclick="requestPairing()" class="w-full bg-emerald-600 hover:bg-emerald-500 active:scale-[0.99] text-white text-sm font-semibold py-2.5 rounded-xl transition shadow-lg shadow-emerald-950/50 flex items-center justify-center space-x-2">
+                    <i class="fa-solid fa-key"></i>
+                    <span>Get Pairing Code</span>
+                </button>
+
+                <div id="pairing-code-box" class="hidden bg-slate-950 border border-emerald-500/30 p-4 rounded-xl text-center space-y-2 mt-3">
+                    <p class="text-xs text-slate-400">Enter this code in WhatsApp (Linked Devices > Link with Phone Number):</p>
+                    <div id="pairing-code" class="text-2xl font-mono font-bold tracking-widest text-emerald-400 bg-emerald-500/10 py-2 rounded-lg border border-emerald-500/20">--------</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Campaign Creator -->
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl space-y-4">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+                <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider">Campaign Setup</h2>
+                <i class="fa-solid fa-paper-plane text-slate-500"></i>
+            </div>
+
+            <!-- Tab Buttons -->
+            <div class="grid grid-cols-2 gap-2 bg-slate-950 p-1 rounded-xl border border-slate-800">
+                <button id="tab-manual-btn" onclick="switchTab('manual')" class="py-1.5 text-xs font-semibold rounded-lg bg-slate-800 text-white transition">Manual Input</button>
+                <button id="tab-file-btn" onclick="switchTab('file')" class="py-1.5 text-xs font-semibold rounded-lg text-slate-400 transition hover:text-white">Upload File</button>
+            </div>
+
+            <!-- Tab 1: Manual Numbers -->
+            <div id="tab-manual" class="space-y-1">
+                <label class="text-xs text-slate-400 font-medium">Recipient Numbers (One per line)</label>
+                <textarea id="numbers" rows="5" placeholder="2348011112222&#10;2348033334444" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm focus:outline-none focus:border-emerald-500 transition font-mono text-slate-200 mt-1 placeholder-slate-700"></textarea>
+            </div>
+
+            <!-- Tab 2: File Upload -->
+            <div id="tab-file" class="hidden space-y-2">
+                <label class="text-xs text-slate-400 font-medium">Upload Contact File (.csv or .txt)</label>
+                <div class="border-2 border-dashed border-slate-800 rounded-xl p-5 text-center bg-slate-950 hover:border-slate-700 transition cursor-pointer" onclick="document.getElementById('file-input').click()">
+                    <i class="fa-solid fa-file-csv text-2xl text-emerald-400 mb-1"></i>
+                    <p class="text-xs text-slate-300 font-medium" id="file-name">Tap to select CSV or TXT file</p>
+                    <p class="text-[10px] text-slate-500 mt-1">Numbers must be in the first column</p>
+                    <input type="file" id="file-input" accept=".csv,.txt" class="hidden" onchange="handleFileUpload(event)">
+                </div>
+            </div>
+
+            <!-- Message Input -->
+            <div>
+                <label class="text-xs text-slate-400 font-medium">Message Body</label>
+                <textarea id="message" rows="4" placeholder="Type your broadcast message here..." class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm focus:outline-none focus:border-emerald-500 transition text-slate-200 mt-1 placeholder-slate-700"></textarea>
+            </div>
+
+            <!-- Delay Configuration -->
+            <div>
+                <div class="flex justify-between items-center">
+                    <label class="text-xs text-slate-400 font-medium">Safety Delay Between Messages</label>
+                    <span id="delay-val" class="text-xs font-mono text-emerald-400 font-bold">8 sec</span>
+                </div>
+                <input type="range" id="delaySec" min="3" max="30" value="8" oninput="document.getElementById('delay-val').innerText = this.value + ' sec'" class="w-full accent-emerald-500 mt-2">
+            </div>
+
+            <!-- Submit Button -->
+            <button onclick="sendBroadcast()" class="w-full bg-blue-600 hover:bg-blue-500 active:scale-[0.99] text-white text-sm font-semibold py-3 rounded-xl transition shadow-lg shadow-blue-950/50 flex items-center justify-center space-x-2">
+                <i class="fa-solid fa-rocket"></i>
+                <span>Launch Campaign</span>
+            </button>
+        </div>
+
+    </main>
+
+    <script>
+        let uploadedNumbers = '';
+
+        function switchTab(tab) {
+            if (tab === 'manual') {
+                document.getElementById('tab-manual').classList.remove('hidden');
+                document.getElementById('tab-file').classList.add('hidden');
+                document.getElementById('tab-manual-btn').className = "py-1.5 text-xs font-semibold rounded-lg bg-slate-800 text-white transition";
+                document.getElementById('tab-file-btn').className = "py-1.5 text-xs font-semibold rounded-lg text-slate-400 transition hover:text-white";
+            } else {
+                document.getElementById('tab-file').classList.remove('hidden');
+                document.getElementById('tab-manual').classList.add('hidden');
+                document.getElementById('tab-file-btn').className = "py-1.5 text-xs font-semibold rounded-lg bg-slate-800 text-white transition";
+                document.getElementById('tab-manual-btn').className = "py-1.5 text-xs font-semibold rounded-lg text-slate-400 transition hover:text-white";
+            }
+        }
+
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            document.getElementById('file-name').innerText = file.name;
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                uploadedNumbers = e.target.result;
+            };
+            reader.readAsText(file);
+        }
+
+        async function checkStatus() {
+            try {
+                const res = await fetch('/status');
+                const data = await res.json();
+                const badge = document.getElementById('status-badge');
+                const statusText = document.getElementById('status-text');
+
+                statusText.innerText = data.status;
+
+                if (data.status === 'CONNECTED') {
+                    badge.className = "px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center space-x-1.5";
+                    badge.querySelector('span').className = "w-2 h-2 rounded-full bg-emerald-500";
+                } else if (data.status === 'CONNECTING') {
+                    badge.className = "px-3 py-1 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20 flex items-center space-x-1.5";
+                    badge.querySelector('span').className = "w-2 h-2 rounded-full bg-amber-500 animate-ping";
+                } else {
+                    badge.className = "px-3 py-1 rounded-full text-xs font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20 flex items-center space-x-1.5";
+                    badge.querySelector('span').className = "w-2 h-2 rounded-full bg-rose-500 animate-pulse";
+                }
+
+                if (data.pairingCode) {
+                    document.getElementById('pairing-code-box').classList.remove('hidden');
+                    document.getElementById('pairing-code').innerText = data.pairingCode;
+                }
+            } catch (err) {}
+        }
+
+        async function requestPairing() {
+            const phone = document.getElementById('phone-num').value;
+            if (!phone) return alert('Please enter your WhatsApp phone number');
+            await fetch('/connect-pairing', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone })
+            });
+            alert('Pairing code requested. Standby...');
+        }
+
+        async function sendBroadcast() {
+            const isManual = !document.getElementById('tab-manual').classList.contains('hidden');
+            const numbers = isManual ? document.getElementById('numbers').value : uploadedNumbers;
+            const message = document.getElementById('message').value;
+            const delaySeconds = document.getElementById('delaySec').value;
+
+            if (!numbers || !message) return alert('Please provide recipient numbers and a message.');
+
+            const res = await fetch('/send-broadcast', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ numbers, message, delaySeconds })
+            });
+            const data = await res.json();
+            alert(data.message || data.error);
+        }
+
+        setInterval(checkStatus, 3000);
+        checkStatus();
+    </script>
+</body>
+</html>
