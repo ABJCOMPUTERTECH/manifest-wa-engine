@@ -1,8 +1,8 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, disconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, disconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const useMongoDBAuthState = require('baileys-mongodb-auth');
 const pino = require('pino');
 const path = require('path');
-const fs = require('fs');
 const { MongoClient } = require('mongodb');
 
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
@@ -15,40 +15,30 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || 'supersecretkey';
-const MONGO_URI = process.env.MONGO_URI;
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017';
 
 const sessions = new Map();
+let mongoClient = null;
 let db = null;
 
-if (MONGO_URI) {
-    MongoClient.connect(MONGO_URI)
-        .then(client => {
-            db = client.db('broadcast_engine');
-            console.log('✅ MongoDB Atlas Connected');
-        })
-        .catch(err => console.error('MongoDB Error:', err));
-}
-
-function getAuthPath(tenantId) {
-    const dir = path.join(__dirname, 'sessions', tenantId);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    return dir;
-}
-
-function removeAuthFolder(tenantId) {
-    const dir = path.join(__dirname, 'sessions', tenantId);
-    if (fs.existsSync(dir)) {
-        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+async function initMongo() {
+    if (!mongoClient) {
+        mongoClient = new MongoClient(MONGO_URI);
+        await mongoClient.connect();
+        db = mongoClient.db('broadcast_engine');
+        console.log('✅ MongoDB Atlas Connected');
     }
 }
+initMongo().catch(err => console.error('MongoDB Initial Connection Error:', err));
 
 async function getOrCreateSession(tenantId) {
     if (sessions.has(tenantId)) {
         return sessions.get(tenantId);
     }
 
-    const authPath = getAuthPath(tenantId);
-    const { state, saveCreds } = await useMultiFileAuthState(authPath);
+    await initMongo();
+    const collection = db.collection(`auth_${tenantId}`);
+    const { state, saveCreds } = await useMongoDBAuthState(collection);
 
     let version;
     try {
@@ -62,14 +52,14 @@ async function getOrCreateSession(tenantId) {
         printQRInTerminal: false,
         auth: state,
         browser: ["Ubuntu", "Chrome", "20.0.04"],
-        connectTimeoutMs: 120000,        // Increased to 2 minutes
-        defaultQueryTimeoutMs: 120000,   // Increased to 2 minutes
-        keepAliveIntervalMs: 25000
+        connectTimeoutMs: 120000,
+        defaultQueryTimeoutMs: 120000,
+        keepAliveIntervalMs: 25000,
+        syncFullHistory: false
     });
 
     const sessionData = { sock, isConnected: false, readyPromise: null };
 
-    // Increased socket readiness wait time to 60 seconds
     sessionData.readyPromise = new Promise((resolve) => {
         const handler = (update) => {
             if (update.qr || update.connection === 'open') {
@@ -83,13 +73,13 @@ async function getOrCreateSession(tenantId) {
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === 'close') {
             sessionData.isConnected = false;
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             if (statusCode === disconnectReason.loggedOut) {
-                removeAuthFolder(tenantId);
+                try { await collection.drop(); } catch (e) {}
                 sessions.delete(tenantId);
             } else {
                 setTimeout(() => {
@@ -99,7 +89,7 @@ async function getOrCreateSession(tenantId) {
             }
         } else if (connection === 'open') {
             sessionData.isConnected = true;
-            console.log(`✅ Tenant [${tenantId}] Active!`);
+            console.log(`✅ Tenant [${tenantId}] Active & Synced to MongoDB!`);
         }
     });
 
@@ -135,31 +125,8 @@ app.post('/api/pair', async (req, res) => {
         return res.json({ code, connected: false, tenantId: cleanNum });
     } catch (err) {
         console.error(`Pairing error for ${cleanNum}:`, err);
-        return res.status(500).json({ error: err.message || 'Failed to generate pairing code. Please try again.' });
+        return res.status(500).json({ error: err.message || 'Failed to generate pairing code.' });
     }
-});
-
-app.post('/api/vip/grant', async (req, res) => {
-    const { adminSecret, phoneNumber } = req.body;
-    if (!adminSecret || adminSecret.trim() !== ADMIN_KEY.trim()) {
-        return res.status(401).json({ error: 'Unauthorized: Invalid Admin Secret Key.' });
-    }
-    if (!phoneNumber) return res.status(400).json({ error: 'Phone number is required.' });
-
-    const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
-    if (db) {
-        try {
-            await db.collection('vip_users').updateOne(
-                { _id: cleanNum },
-                { $set: { vip: true, grantedAt: new Date() } },
-                { upsert: true }
-            );
-            return res.json({ success: true, message: `Granted VIP status to +${cleanNum}` });
-        } catch (e) {
-            return res.status(500).json({ error: 'Database update failed.' });
-        }
-    }
-    res.json({ success: true, message: `VIP set locally for +${cleanNum}` });
 });
 
 app.post('/api/campaign/send', async (req, res) => {
