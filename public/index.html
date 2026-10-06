@@ -6,7 +6,7 @@
     <title>BroadcastEngine Dashboard</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
-        .container { max-width: 500px; margin: auto; background: #1e293b; padding: 24px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+        .container { max-width: 520px; margin: auto; background: #1e293b; padding: 24px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
         h2 { margin-top: 0; color: #38bdf8; }
         .status { font-weight: bold; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
         .disconnected { background: #7f1d1d; color: #fca5a5; }
@@ -15,7 +15,10 @@
         button { background: #2563eb; font-weight: bold; border: none; cursor: pointer; }
         button:hover { background: #1d4ed8; }
         .code-box { background: #0284c7; color: #fff; text-align: center; font-size: 24px; font-weight: bold; letter-spacing: 4px; padding: 16px; border-radius: 8px; margin-top: 12px; display: none; }
-        .section-title { margin-top: 20px; border-top: 1px solid #334155; padding-top: 16px; }
+        .section-title { margin-top: 24px; border-top: 1px solid #334155; padding-top: 16px; }
+        .file-upload { border: 2px dashed #334155; padding: 12px; text-align: center; border-radius: 8px; margin-bottom: 16px; background: #0f172a; cursor: pointer; }
+        .file-upload input { display: none; }
+        .badge { background: #334155; padding: 2px 8px; border-radius: 10px; font-size: 12px; float: right; }
     </style>
 </head>
 <body>
@@ -40,25 +43,34 @@
 
         <div class="section-title">
             <h3>Broadcast Campaign</h3>
-            <label>Recipients (Comma separated)</label>
-            <input type="text" id="recipients" placeholder="12345678901, 12345678902">
+            
+            <label>Batch Upload Contacts (.CSV / .TXT)</label>
+            <div class="file-upload" onclick="document.getElementById('fileInput').click()">
+                <span id="fileLabel">📁 Tap to upload contacts file</span>
+                <input type="file" id="fileInput" accept=".csv, .txt" onchange="handleFileUpload(event)">
+            </div>
+
+            <label>Recipients (Comma or line separated) <span id="contactCount" class="badge">0 loaded</span></label>
+            <textarea id="recipients" rows="4" placeholder="12345678901&#10;12345678902&#10;12345678903"></textarea>
             
             <label>Anti-Spam Delay Between Messages</label>
             <select id="delayInterval">
                 <option value="5000">5 Seconds (Fast)</option>
                 <option value="15000" selected>15 Seconds (Recommended)</option>
                 <option value="30000">30 Seconds (Safe)</option>
-                <option value="60000">60 Seconds (High Anti-Spam)</option>
+                <option value="60000">60 Seconds (High Anti-Spam Safety)</option>
             </select>
 
-            <label>Message Body</label>
-            <textarea id="message" rows="4" placeholder="Type your campaign message here..."></textarea>
+            <label>Message Body (Supports Spintax e.g. {Hello|Hi|Hey})</label>
+            <textarea id="message" rows="4" placeholder="{Hello|Hi|Greetings}! This is a broadcast message."></textarea>
             
             <button onclick="sendCampaign()" style="background: #16a34a;">Send Campaign</button>
         </div>
     </div>
 
     <script>
+        let loadedRecipients = [];
+
         async function checkStatus() {
             try {
                 const res = await fetch('/api/status');
@@ -98,6 +110,32 @@
                 codeBox.textContent = 'Failed to fetch code.';
             }
         }
+
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const text = e.target.result;
+                const numbers = text.split(/[\r\n,]+/)
+                    .map(num => num.replace(/[^0-9]/g, ''))
+                    .filter(num => num.length >= 7);
+
+                loadedRecipients = [...new Set(numbers)];
+                document.getElementById('recipients').value = loadedRecipients.join('\n');
+                document.getElementById('contactCount').textContent = loadedRecipients.length + ' loaded';
+                document.getElementById('fileLabel').textContent = `✅ ${file.name} (${loadedRecipients.length} contacts)`;
+            };
+            reader.readAsText(file);
+        }
+
+        document.getElementById('recipients').addEventListener('input', (e) => {
+            const numbers = e.target.value.split(/[\r\n,]+/)
+                .map(num => num.replace(/[^0-9]/g, ''))
+                .filter(num => num.length >= 7);
+            document.getElementById('contactCount').textContent = numbers.length + ' loaded';
+        });
 
         async function grantVip() {
             const adminSecret = document.getElementById('adminKey').value.trim();
