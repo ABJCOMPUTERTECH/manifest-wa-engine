@@ -17,36 +17,48 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || 'supersecretkey';
 const MONGO_URI = process.env.MONGO_URI;
 
-let sock = null;
-let isConnected = false;
+// Multi-Tenant Session Pool
+const sessions = new Map(); // tenantId -> { sock, isConnected, qrCode, pairingCode }
 let db = null;
-let isInitializing = false;
 
 if (MONGO_URI) {
     MongoClient.connect(MONGO_URI)
         .then(client => {
             db = client.db('broadcast_engine');
-            console.log('MongoDB Atlas Connected');
+            console.log('✅ MongoDB Atlas Connected (Multi-Tenant Mode)');
         })
-        .catch(err => console.error('MongoDB Error:', err));
+        .catch(err => console.error('MongoDB Connection Error:', err));
 }
 
-function cleanAuthFolder() {
-    const authPath = path.join(__dirname, 'auth_info_baileys');
-    if (fs.existsSync(authPath)) {
+// Session Directory Manager per Tenant
+function getAuthPath(tenantId) {
+    const dir = path.join(__dirname, 'sessions', tenantId);
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+    return dir;
+}
+
+function removeAuthFolder(tenantId) {
+    const dir = path.join(__dirname, 'sessions', tenantId);
+    if (fs.existsSync(dir)) {
         try {
-            fs.rmSync(authPath, { recursive: true, force: true });
+            fs.rmSync(dir, { recursive: true, force: true });
         } catch (e) {
-            console.error('Error cleaning auth folder:', e);
+            console.error(`Error deleting session folder for ${tenantId}:`, e);
         }
     }
 }
 
-async function startWhatsAppSocket() {
-    if (isInitializing) return;
-    isInitializing = true;
+// Multi-Tenant WhatsApp Connection Initializer
+async function initTenantSession(tenantId) {
+    if (sessions.has(tenantId) && sessions.get(tenantId).sock) {
+        return sessions.get(tenantId);
+    }
 
-    const authPath = path.join(__dirname, 'auth_info_baileys');
+    const authPath = getAuthPath(tenantId);
+    const sessionData = { sock: null, isConnected: false, pairingCode: null };
+    sessions.set(tenantId, sessionData);
 
     try {
         const { state, saveCreds } = await useMultiFileAuthState(authPath);
@@ -56,10 +68,10 @@ async function startWhatsAppSocket() {
             const fetched = await fetchLatestBaileysVersion();
             version = fetched.version;
         } catch (vErr) {
-            console.warn('Could not fetch latest Baileys version, using default fallback.');
+            console.warn('Using default Baileys version fallback.');
         }
 
-        sock = makeWASocket({
+        const sock = makeWASocket({
             ...(version ? { version } : {}),
             logger: pino({ level: 'fatal' }),
             printQRInTerminal: false,
@@ -70,41 +82,56 @@ async function startWhatsAppSocket() {
             keepAliveIntervalMs: 10000
         });
 
+        sessionData.sock = sock;
+
         sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect } = update;
 
             if (connection === 'close') {
-                isConnected = false;
-                isInitializing = false;
+                sessionData.isConnected = false;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                
+
                 if (statusCode === disconnectReason.loggedOut) {
-                    console.log('Logged out from WhatsApp. Wiping session.');
-                    cleanAuthFolder();
-                    setTimeout(() => startWhatsAppSocket(), 2000);
+                    console.log(`Tenant [${tenantId}] logged out. Wiping session.`);
+                    removeAuthFolder(tenantId);
+                    sessions.delete(tenantId);
                 } else {
-                    console.log('Connection closed. Reconnecting...');
-                    setTimeout(() => startWhatsAppSocket(), 3000);
+                    console.log(`Tenant [${tenantId}] connection closed. Reconnecting...`);
+                    setTimeout(() => initTenantSession(tenantId), 3000);
                 }
             } else if (connection === 'open') {
-                isConnected = true;
-                isInitializing = false;
-                console.log('✅ WhatsApp connection active and ready!');
+                sessionData.isConnected = true;
+                console.log(`✅ Tenant [${tenantId}] WhatsApp connection active!`);
             }
         });
-    } catch (e) {
-        console.error('Socket Init Error:', e);
-    } finally {
-        isInitializing = false;
+
+        return sessionData;
+    } catch (err) {
+        console.error(`Session Init Failed for Tenant [${tenantId}]:`, err);
+        sessions.delete(tenantId);
+        throw err;
     }
 }
 
+// Get Session Status for a Specific User/Tenant
 app.get('/api/status', (req, res) => {
-    res.json({ connected: isConnected });
+    const tenantId = req.query.tenantId || req.query.phoneNumber;
+    if (!tenantId) {
+        return res.status(400).json({ error: 'tenantId or phoneNumber parameter is required.' });
+    }
+
+    const cleanId = tenantId.replace(/[^0-9]/g, '');
+    const session = sessions.get(cleanId);
+
+    res.json({
+        tenantId: cleanId,
+        connected: session ? session.isConnected : false
+    });
 });
 
+// Request Pairing Code for a Specific User/Tenant
 app.post('/api/pair', async (req, res) => {
     const { phoneNumber } = req.body;
     if (!phoneNumber) return res.status(400).json({ error: 'Phone number is required.' });
@@ -112,35 +139,36 @@ app.post('/api/pair', async (req, res) => {
     const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
     if (cleanNum.length < 10) return res.status(400).json({ error: 'Invalid phone number format.' });
 
-    if (isConnected) {
-        return res.json({ connected: true, message: 'Device is already connected.' });
-    }
-
     try {
-        // Ensure background socket exists
-        if (!sock || !sock.ws) {
-            startWhatsAppSocket();
+        let session = sessions.get(cleanNum);
+
+        if (session && session.isConnected) {
+            return res.json({ connected: true, message: 'Device is already connected.' });
         }
 
-        // Wait up to 15s for WS readyState
+        // Initialize or retrieve user-specific socket session
+        session = await initTenantSession(cleanNum);
+
+        // Wait for WebSocket ready state
         let attempts = 0;
-        while ((!sock || !sock.ws || sock.ws.readyState !== 1) && attempts < 30) {
+        while ((!session.sock || !session.sock.ws || session.sock.ws.readyState !== 1) && attempts < 30) {
             await new Promise(r => setTimeout(r, 500));
             attempts++;
         }
 
-        if (!sock || !sock.ws || sock.ws.readyState !== 1) {
-            return res.status(500).json({ error: 'WhatsApp service initializing. Please tap Request Pairing Code again in 5 seconds.' });
+        if (!session.sock || !session.sock.ws || session.sock.ws.readyState !== 1) {
+            return res.status(500).json({ error: 'Session setup initializing. Tap Request Pairing Code again.' });
         }
 
-        const code = await sock.requestPairingCode(cleanNum);
-        return res.json({ code, connected: false });
+        const code = await session.sock.requestPairingCode(cleanNum);
+        return res.json({ code, connected: false, tenantId: cleanNum });
     } catch (err) {
-        console.error('Pairing Code Request Error:', err);
-        return res.status(500).json({ error: err.message || 'Failed to request pairing code.' });
+        console.error(`Pairing Error for ${cleanNum}:`, err);
+        return res.status(500).json({ error: err.message || 'Failed to generate pairing code.' });
     }
 });
 
+// Admin VIP Access Route
 app.post('/api/vip/grant', async (req, res) => {
     const { adminSecret, phoneNumber } = req.body;
 
@@ -168,12 +196,21 @@ app.post('/api/vip/grant', async (req, res) => {
     res.json({ success: true, message: `VIP set locally for +${cleanNum} (MongoDB not connected)` });
 });
 
+// Launch Multi-Tenant Campaign
 app.post('/api/campaign/send', async (req, res) => {
-    if (!isConnected) {
-        return res.status(400).json({ error: 'WhatsApp account not linked or session lost. Please link a device first.' });
+    const { senderNumber, recipients, message, delay } = req.body;
+
+    if (!senderNumber) {
+        return res.status(400).json({ error: 'senderNumber (your linked WhatsApp number) is required.' });
     }
 
-    const { recipients, message, delay } = req.body;
+    const tenantId = senderNumber.replace(/[^0-9]/g, '');
+    const session = sessions.get(tenantId);
+
+    if (!session || !session.isConnected) {
+        return res.status(400).json({ error: `WhatsApp account +${tenantId} is not linked. Please pair device first.` });
+    }
+
     if (!recipients || !message) {
         return res.status(400).json({ error: 'Recipients and message body are required.' });
     }
@@ -198,21 +235,22 @@ app.post('/api/campaign/send', async (req, res) => {
         });
     };
 
-    res.json({ success: true, message: `Campaign initiated for ${phoneList.length} recipient(s).` });
+    res.json({ success: true, message: `Campaign initiated for ${phoneList.length} recipient(s) via +${tenantId}.` });
 
+    // Background job isolated per tenant
     (async () => {
         for (let i = 0; i < phoneList.length; i++) {
             const phone = phoneList[i];
             try {
                 const parsedMsg = parseSpintax(message);
                 const jid = `${phone}@s.whatsapp.net`;
-                await sock.sendMessage(jid, { text: parsedMsg });
-                console.log(`[${i + 1}/${phoneList.length}] Sent to ${phone}`);
+                await session.sock.sendMessage(jid, { text: parsedMsg });
+                console.log(`[Tenant +${tenantId}] [${i + 1}/${phoneList.length}] Sent to ${phone}`);
 
                 const jitter = Math.floor(Math.random() * 2000);
                 await new Promise(r => setTimeout(r, interval + jitter));
             } catch (err) {
-                console.error(`Failed to send to ${phone}:`, err);
+                console.error(`[Tenant +${tenantId}] Failed to send to ${phone}:`, err);
             }
         }
     })();
@@ -223,6 +261,5 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Manifest WA Engine active on port ${PORT}`);
-    startWhatsAppSocket();
+    console.log(`🚀 Multi-Tenant Manifest Engine running on port ${PORT}`);
 });
