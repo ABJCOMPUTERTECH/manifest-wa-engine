@@ -11,10 +11,11 @@
         .status { font-weight: bold; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
         .disconnected { background: #7f1d1d; color: #fca5a5; }
         .connected { background: #14532d; color: #86efac; }
-        input, textarea, button { width: 100%; box-sizing: border-box; margin-top: 8px; margin-bottom: 16px; padding: 12px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #fff; }
+        input, textarea, button, select { width: 100%; box-sizing: border-box; margin-top: 8px; margin-bottom: 16px; padding: 12px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #fff; }
         button { background: #2563eb; font-weight: bold; border: none; cursor: pointer; }
         button:hover { background: #1d4ed8; }
         .code-box { background: #0284c7; color: #fff; text-align: center; font-size: 24px; font-weight: bold; letter-spacing: 4px; padding: 16px; border-radius: 8px; margin-top: 12px; display: none; }
+        .section-title { margin-top: 20px; border-top: 1px solid #334155; padding-top: 16px; }
     </style>
 </head>
 <body>
@@ -23,21 +24,38 @@
         
         <h3>Device Connection</h3>
         <label>WhatsApp Phone Number (with country code)</label>
-        <input type="text" id="phoneNum" placeholder="2348163883487">
+        <input type="text" id="phoneNum" placeholder="12345678900">
         <button onclick="requestPairing()">Request Pairing Code</button>
         
         <div id="pairingCodeDisplay" class="code-box"></div>
 
-        <hr style="border-color: #334155; margin: 24px 0;">
+        <div class="section-title">
+            <h3>VIP Access Management</h3>
+            <label>Admin Secret Key</label>
+            <input type="password" id="adminKey" placeholder="Enter Admin Secret Key">
+            <label>User Phone Number to Grant VIP</label>
+            <input type="text" id="vipPhone" placeholder="12345678900">
+            <button onclick="grantVip()" style="background: #8b5cf6;">Grant VIP Access</button>
+        </div>
 
-        <h3>Broadcast Campaign</h3>
-        <label>Recipients (Comma separated)</label>
-        <input type="text" id="recipients" placeholder="2348011112222, 2348033334444">
-        
-        <label>Message Body</label>
-        <textarea id="message" rows="4" placeholder="Type your broadcast message here..."></textarea>
-        
-        <button onclick="sendCampaign()" style="background: #16a34a;">Send Campaign</button>
+        <div class="section-title">
+            <h3>Broadcast Campaign</h3>
+            <label>Recipients (Comma separated)</label>
+            <input type="text" id="recipients" placeholder="12345678901, 12345678902">
+            
+            <label>Anti-Spam Delay Between Messages</label>
+            <select id="delayInterval">
+                <option value="5000">5 Seconds (Fast)</option>
+                <option value="15000" selected>15 Seconds (Recommended)</option>
+                <option value="30000">30 Seconds (Safe)</option>
+                <option value="60000">60 Seconds (High Anti-Spam)</option>
+            </select>
+
+            <label>Message Body</label>
+            <textarea id="message" rows="4" placeholder="Type your campaign message here..."></textarea>
+            
+            <button onclick="sendCampaign()" style="background: #16a34a;">Send Campaign</button>
+        </div>
     </div>
 
     <script>
@@ -57,8 +75,8 @@
         }
 
         async function requestPairing() {
-            const phone = document.getElementById('phoneNum').value;
-            if (!phone) return alert('Please enter a phone number.');
+            const phone = document.getElementById('phoneNum').value.trim();
+            if (!phone) return alert('Please enter a valid phone number.');
 
             const codeBox = document.getElementById('pairingCodeDisplay');
             codeBox.style.display = 'block';
@@ -81,9 +99,31 @@
             }
         }
 
+        async function grantVip() {
+            const adminSecret = document.getElementById('adminKey').value.trim();
+            const phoneNumber = document.getElementById('vipPhone').value.trim();
+
+            if (!adminSecret || !phoneNumber) {
+                return alert('Please fill in both the admin secret key and phone number.');
+            }
+
+            try {
+                const res = await fetch('/api/vip/grant', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ adminSecret, phoneNumber })
+                });
+                const data = await res.json();
+                alert(data.message || data.error);
+            } catch (e) {
+                alert('Failed to grant VIP access.');
+            }
+        }
+
         async function sendCampaign() {
-            const recipients = document.getElementById('recipients').value;
-            const message = document.getElementById('message').value;
+            const recipients = document.getElementById('recipients').value.trim();
+            const message = document.getElementById('message').value.trim();
+            const delay = document.getElementById('delayInterval').value;
 
             if (!recipients || !message) return alert('Please fill in both fields.');
 
@@ -91,7 +131,7 @@
                 const res = await fetch('/api/campaign/send', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ recipients, message })
+                    body: JSON.stringify({ recipients, message, delay })
                 });
                 const data = await res.json();
                 alert(data.message || data.error);
