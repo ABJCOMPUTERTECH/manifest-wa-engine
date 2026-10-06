@@ -1,5 +1,5 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, disconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, disconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
@@ -16,7 +16,7 @@ const MONGO_URI = process.env.MONGO_URI;
 let sock = null;
 let isConnected = false;
 let db = null;
-let currentPairingPhone = null;
+let isInitializing = false;
 
 if (MONGO_URI) {
     MongoClient.connect(MONGO_URI)
@@ -27,10 +27,22 @@ if (MONGO_URI) {
         .catch(err => console.error('MongoDB Error:', err));
 }
 
-async function initWhatsApp(cleanSession = false) {
+function cleanAuthFolder() {
     const authPath = path.join(__dirname, 'auth_info_baileys');
+    if (fs.existsSync(authPath)) {
+        try {
+            fs.rmSync(authPath, { recursive: true, force: true });
+        } catch (e) {
+            console.error('Error cleaning auth folder:', e);
+        }
+    }
+}
 
-    if (cleanSession) {
+async function initWhatsApp(forceClean = false) {
+    if (isInitializing) return;
+    isInitializing = true;
+
+    if (forceClean) {
         if (sock) {
             try {
                 sock.ev.removeAllListeners();
@@ -38,25 +50,25 @@ async function initWhatsApp(cleanSession = false) {
             } catch (e) {}
             sock = null;
         }
-        if (fs.existsSync(authPath)) {
-            try {
-                fs.rmSync(authPath, { recursive: true, force: true });
-            } catch (e) {}
-        }
+        cleanAuthFolder();
         isConnected = false;
     }
 
+    const authPath = path.join(__dirname, 'auth_info_baileys');
+
     try {
         const { state, saveCreds } = await useMultiFileAuthState(authPath);
-        const { version } = await fetchLatestBaileysVersion();
 
         sock = makeWASocket({
-            version,
-            logger: pino({ level: 'silent' }),
+            // Stable version array to bypass external fetch delays on Render
+            version: [2, 3000, 1015901307],
+            logger: pino({ level: 'fatal' }),
             printQRInTerminal: false,
             auth: state,
-            // Official browser identifier required for web client pairing
-            browser: ["Chrome (Linux)", "Chrome", "110.0.5481.177"]
+            browser: ["Ubuntu", "Chrome", "20.0.04"],
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 10000
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -66,22 +78,24 @@ async function initWhatsApp(cleanSession = false) {
 
             if (connection === 'close') {
                 isConnected = false;
+                isInitializing = false;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 
-                // Do NOT wipe auth files during connection reconnect loops
-                if (statusCode !== disconnectReason.loggedOut) {
-                    setTimeout(() => initWhatsApp(false), 3000);
+                if (statusCode === disconnectReason.loggedOut) {
+                    console.log('Device logged out. Wiping session.');
+                    cleanAuthFolder();
                 } else {
-                    console.log('Logged out. Session cleared.');
-                    initWhatsApp(true);
+                    setTimeout(() => initWhatsApp(false), 3000);
                 }
             } else if (connection === 'open') {
                 isConnected = true;
-                console.log('✅ WhatsApp device connected successfully!');
+                isInitializing = false;
+                console.log('✅ WhatsApp connection active!');
             }
         });
     } catch (e) {
         console.error('Socket Init Error:', e);
+        isInitializing = false;
     }
 }
 
@@ -94,32 +108,29 @@ app.post('/api/pair', async (req, res) => {
     if (!phoneNumber) return res.status(400).json({ error: 'Phone number is required.' });
 
     const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
-    if (cleanNum.length < 10) return res.status(400).json({ error: 'Invalid phone number length.' });
+    if (cleanNum.length < 10) return res.status(400).json({ error: 'Invalid phone number format.' });
 
     try {
-        // If device is already connected, no need to pair again
         if (isConnected) {
-            return res.json({ connected: true, message: 'Device is already linked and active.' });
+            return res.json({ connected: true, message: 'Device is already connected.' });
         }
 
-        // Initialize fresh socket if null or disconnected, but keep state for key exchange
-        if (!sock || !sock.ws || sock.ws.readyState !== 1) {
-            await initWhatsApp(true);
-        }
+        // Force a fresh session initialization for new pairing attempts
+        await initWhatsApp(true);
 
-        // Wait for socket open state
+        // Wait up to 25 seconds for WebSocket connection state
         let attempts = 0;
-        while ((!sock || !sock.ws || sock.ws.readyState !== 1) && attempts < 15) {
+        while ((!sock || !sock.ws || sock.ws.readyState !== 1) && attempts < 50) {
             await new Promise(r => setTimeout(r, 500));
             attempts++;
         }
 
-        if (!sock || sock.ws.readyState !== 1) {
-            return res.status(500).json({ error: 'Connection to WhatsApp servers timed out. Please try again.' });
+        if (!sock || !sock.ws || sock.ws.readyState !== 1) {
+            return res.status(500).json({ error: 'WhatsApp connection timeout. Please tap Request Pairing Code again.' });
         }
 
-        // Small delay to allow handshake readiness
-        await new Promise(r => setTimeout(r, 1000));
+        // Delay to allow WebSocket handshake completion
+        await new Promise(r => setTimeout(r, 2000));
 
         const code = await sock.requestPairingCode(cleanNum);
         return res.json({ code, connected: false });
@@ -146,9 +157,10 @@ app.post('/api/vip/grant', async (req, res) => {
             { $set: { vip: true, grantedAt: new Date() } },
             { upsert: true }
         );
+        return res.json({ success: true, message: `Granted VIP status to +${cleanNum}` });
     }
 
-    res.json({ success: true, message: `Granted VIP status to +${cleanNum}` });
+    res.json({ success: true, message: `VIP set locally for +${cleanNum} (MongoDB not connected)` });
 });
 
 app.post('/api/campaign/send', async (req, res) => {
