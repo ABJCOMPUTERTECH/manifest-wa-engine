@@ -1,7 +1,8 @@
 const express = require('express');
-const { default: makeWASocket, disconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, disconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
+const fs = require('fs');
 const { MongoClient } = require('mongodb');
 
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
@@ -18,20 +19,33 @@ const MONGO_URI = process.env.MONGO_URI;
 
 const sessions = new Map();
 let db = null;
+let mongoClientPromise = null;
 
-if (MONGO_URI) {
-    MongoClient.connect(MONGO_URI)
-        .then(client => {
+async function getDb() {
+    if (db) return db;
+    if (!MONGO_URI) return null;
+    if (!mongoClientPromise) {
+        mongoClientPromise = MongoClient.connect(MONGO_URI).then(client => {
             db = client.db('broadcast_engine');
             console.log('✅ MongoDB Atlas Connected Successfully');
-        })
-        .catch(err => console.error('MongoDB Connection Error:', err));
+            return db;
+        }).catch(err => {
+            mongoClientPromise = null;
+            console.error('MongoDB Connection Error:', err);
+            return null;
+        });
+    }
+    return mongoClientPromise;
 }
 
-// Native Baileys Auth Adapter for MongoDB Atlas
-async function useMongoAuthState(tenantId) {
-    if (!db) throw new Error("MongoDB is not connected. Ensure MONGO_URI is set in Render environment variables.");
-    const collection = db.collection(`session_${tenantId}`);
+function getLocalAuthPath(tenantId) {
+    const dir = path.join(__dirname, 'sessions', tenantId);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
+}
+
+async function useMongoAuthState(database, tenantId) {
+    const collection = database.collection(`session_${tenantId}`);
 
     const readData = async (id) => {
         try {
@@ -110,7 +124,23 @@ async function getOrCreateSession(tenantId) {
         return sessions.get(tenantId);
     }
 
-    const { state, saveCreds, clearSession } = await useMongoAuthState(tenantId);
+    const activeDb = await getDb();
+    let state, saveCreds, clearSession;
+
+    if (activeDb) {
+        const mongoAuth = await useMongoAuthState(activeDb, tenantId);
+        state = mongoAuth.state;
+        saveCreds = mongoAuth.saveCreds;
+        clearSession = mongoAuth.clearSession;
+    } else {
+        const authPath = getLocalAuthPath(tenantId);
+        const localAuth = await useMultiFileAuthState(authPath);
+        state = localAuth.state;
+        saveCreds = localAuth.saveCreds;
+        clearSession = async () => {
+            try { fs.rmSync(authPath, { recursive: true, force: true }); } catch (e) {}
+        };
+    }
 
     let version;
     try {
@@ -161,7 +191,7 @@ async function getOrCreateSession(tenantId) {
             }
         } else if (connection === 'open') {
             sessionData.isConnected = true;
-            console.log(`✅ Tenant [${tenantId}] Linked & Live!`);
+            console.log(`✅ Tenant [${tenantId}] Active!`);
         }
     });
 
