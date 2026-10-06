@@ -17,7 +17,6 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || 'supersecretkey';
 const MONGO_URI = process.env.MONGO_URI;
 
-// Multi-Tenant Session Pool
 const sessions = new Map();
 let db = null;
 
@@ -43,7 +42,6 @@ function removeAuthFolder(tenantId) {
     }
 }
 
-// Get or Create WhatsApp Socket Session
 async function getOrCreateSession(tenantId) {
     if (sessions.has(tenantId)) {
         return sessions.get(tenantId);
@@ -64,14 +62,14 @@ async function getOrCreateSession(tenantId) {
         printQRInTerminal: false,
         auth: state,
         browser: ["Ubuntu", "Chrome", "20.0.04"],
-        connectTimeoutMs: 60000,
-        defaultQueryTimeoutMs: 60000,
-        keepAliveIntervalMs: 10000
+        connectTimeoutMs: 120000,        // Increased to 2 minutes
+        defaultQueryTimeoutMs: 120000,   // Increased to 2 minutes
+        keepAliveIntervalMs: 25000
     });
 
     const sessionData = { sock, isConnected: false, readyPromise: null };
 
-    // Promise that resolves when connection emits qr/pairing-ready state
+    // Increased socket readiness wait time to 60 seconds
     sessionData.readyPromise = new Promise((resolve) => {
         const handler = (update) => {
             if (update.qr || update.connection === 'open') {
@@ -80,8 +78,7 @@ async function getOrCreateSession(tenantId) {
             }
         };
         sock.ev.on('connection.update', handler);
-        // Timeout safety
-        setTimeout(resolve, 15000);
+        setTimeout(resolve, 60000);
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -98,7 +95,7 @@ async function getOrCreateSession(tenantId) {
                 setTimeout(() => {
                     sessions.delete(tenantId);
                     getOrCreateSession(tenantId);
-                }, 3000);
+                }, 5000);
             }
         } else if (connection === 'open') {
             sessionData.isConnected = true;
@@ -132,10 +129,8 @@ app.post('/api/pair', async (req, res) => {
             return res.json({ connected: true, message: 'Device is already connected.' });
         }
 
-        // Wait for connection update event or ready promise
         await session.readyPromise;
 
-        // Request pairing code directly
         const code = await session.sock.requestPairingCode(cleanNum);
         return res.json({ code, connected: false, tenantId: cleanNum });
     } catch (err) {
