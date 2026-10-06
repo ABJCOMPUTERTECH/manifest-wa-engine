@@ -1,6 +1,5 @@
 const express = require('express');
-const { default: makeWASocket, disconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
-const useMongoDBAuthState = require('baileys-mongodb-auth');
+const { default: makeWASocket, disconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
 const { MongoClient } = require('mongodb');
@@ -15,30 +14,103 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || 'supersecretkey';
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017';
+const MONGO_URI = process.env.MONGO_URI;
 
 const sessions = new Map();
-let mongoClient = null;
 let db = null;
 
-async function initMongo() {
-    if (!mongoClient) {
-        mongoClient = new MongoClient(MONGO_URI);
-        await mongoClient.connect();
-        db = mongoClient.db('broadcast_engine');
-        console.log('✅ MongoDB Atlas Connected');
-    }
+if (MONGO_URI) {
+    MongoClient.connect(MONGO_URI)
+        .then(client => {
+            db = client.db('broadcast_engine');
+            console.log('✅ MongoDB Atlas Connected Successfully');
+        })
+        .catch(err => console.error('MongoDB Connection Error:', err));
 }
-initMongo().catch(err => console.error('MongoDB Initial Connection Error:', err));
+
+// Native Baileys Auth Adapter for MongoDB Atlas
+async function useMongoAuthState(tenantId) {
+    if (!db) throw new Error("MongoDB is not connected. Ensure MONGO_URI is set in Render environment variables.");
+    const collection = db.collection(`session_${tenantId}`);
+
+    const readData = async (id) => {
+        try {
+            const document = await collection.findOne({ _id: id });
+            if (!document) return null;
+            return JSON.parse(document.data, BufferJSON.reviver);
+        } catch (e) {
+            return null;
+        }
+    };
+
+    const writeData = async (id, data) => {
+        try {
+            const value = JSON.stringify(data, BufferJSON.replacer);
+            await collection.updateOne(
+                { _id: id },
+                { $set: { data: value } },
+                { upsert: true }
+            );
+        } catch (e) {
+            console.error(`Error writing auth key ${id}:`, e);
+        }
+    };
+
+    const removeData = async (id) => {
+        try {
+            await collection.deleteOne({ _id: id });
+        } catch (e) {}
+    };
+
+    const creds = (await readData('creds')) || initAuthCreds();
+
+    return {
+        state: {
+            creds,
+            keys: {
+                get: async (type, ids) => {
+                    const data = {};
+                    await Promise.all(
+                        ids.map(async (id) => {
+                            let value = await readData(`${type}-${id}`);
+                            if (type === 'app-state-sync-key' && value) {
+                                value = BufferJSON.reviver(type, value);
+                            }
+                            if (value) data[id] = value;
+                        })
+                    );
+                    return data;
+                },
+                set: async (data) => {
+                    const tasks = [];
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id];
+                            const key = `${category}-${id}`;
+                            if (value) {
+                                tasks.push(writeData(key, value));
+                            } else {
+                                tasks.push(removeData(key));
+                            }
+                        }
+                    }
+                    await Promise.all(tasks);
+                }
+            }
+        },
+        saveCreds: () => writeData('creds', creds),
+        clearSession: async () => {
+            try { await collection.drop(); } catch (e) {}
+        }
+    };
+}
 
 async function getOrCreateSession(tenantId) {
     if (sessions.has(tenantId)) {
         return sessions.get(tenantId);
     }
 
-    await initMongo();
-    const collection = db.collection(`auth_${tenantId}`);
-    const { state, saveCreds } = await useMongoDBAuthState(collection);
+    const { state, saveCreds, clearSession } = await useMongoAuthState(tenantId);
 
     let version;
     try {
@@ -58,7 +130,7 @@ async function getOrCreateSession(tenantId) {
         syncFullHistory: false
     });
 
-    const sessionData = { sock, isConnected: false, readyPromise: null };
+    const sessionData = { sock, isConnected: false, readyPromise: null, clearSession };
 
     sessionData.readyPromise = new Promise((resolve) => {
         const handler = (update) => {
@@ -79,7 +151,7 @@ async function getOrCreateSession(tenantId) {
             sessionData.isConnected = false;
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             if (statusCode === disconnectReason.loggedOut) {
-                try { await collection.drop(); } catch (e) {}
+                await clearSession();
                 sessions.delete(tenantId);
             } else {
                 setTimeout(() => {
@@ -89,7 +161,7 @@ async function getOrCreateSession(tenantId) {
             }
         } else if (connection === 'open') {
             sessionData.isConnected = true;
-            console.log(`✅ Tenant [${tenantId}] Active & Synced to MongoDB!`);
+            console.log(`✅ Tenant [${tenantId}] Linked & Live!`);
         }
     });
 
