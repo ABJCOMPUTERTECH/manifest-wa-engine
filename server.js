@@ -15,92 +15,109 @@ const MONGO_URI = process.env.MONGO_URI;
 
 let sock = null;
 let isConnected = false;
+let isInitializing = false;
 let db = null;
 
-// MongoDB Connection
 if (MONGO_URI) {
     MongoClient.connect(MONGO_URI)
         .then(client => {
             db = client.db('broadcast_engine');
-            console.log('Connected to MongoDB Atlas');
+            console.log('MongoDB Atlas Connected');
         })
-        .catch(err => console.error('MongoDB Connection Error:', err));
+        .catch(err => console.error('MongoDB Error:', err));
 }
 
-async function initWhatsApp(force = false) {
+async function initWhatsApp(forceClean = false) {
+    if (isInitializing) return;
+    isInitializing = true;
+
     const authPath = path.join(__dirname, 'auth_info_baileys');
 
-    if (force && fs.existsSync(authPath)) {
-        try {
-            fs.rmSync(authPath, { recursive: true, force: true });
-        } catch (e) {}
+    if (forceClean) {
+        if (sock) {
+            try { sock.ev.removeAllListeners(); sock.end(undefined); } catch (e) {}
+            sock = null;
+        }
+        if (fs.existsSync(authPath)) {
+            try { fs.rmSync(authPath, { recursive: true, force: true }); } catch (e) {}
+        }
+        isConnected = false;
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(authPath);
-    const { version } = await fetchLatestBaileysVersion();
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(authPath);
+        const { version } = await fetchLatestBaileysVersion();
 
-    sock = makeWASocket({
-        version,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: false,
-        auth: state,
-        browser: ["Ubuntu", "Chrome", "20.0.04"]
-    });
+        sock = makeWASocket({
+            version,
+            logger: pino({ level: 'fatal' }),
+            printQRInTerminal: false,
+            auth: state,
+            browser: ["Ubuntu", "Chrome", "20.0.04"]
+        });
 
-    sock.ev.on('creds.update', saveCreds);
+        sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
-
-        if (connection === 'close') {
-            isConnected = false;
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== disconnectReason.loggedOut;
-            if (shouldReconnect) {
-                setTimeout(() => initWhatsApp(false), 3000);
+        sock.ev.on('connection.update', (update) => {
+            const { connection, lastDisconnect } = update;
+            if (connection === 'close') {
+                isConnected = false;
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                if (statusCode !== disconnectReason.loggedOut) {
+                    setTimeout(() => { isInitializing = false; initWhatsApp(false); }, 3000);
+                } else {
+                    isInitializing = false;
+                }
+            } else if (connection === 'open') {
+                isConnected = true;
+                isInitializing = false;
+                console.log('WhatsApp connection active!');
             }
-        } else if (connection === 'open') {
-            isConnected = true;
-            console.log('WhatsApp connection opened successfully.');
-        }
-    });
+        });
+    } catch (e) {
+        console.error('Init Error:', e);
+    } finally {
+        isInitializing = false;
+    }
 }
 
-// Health/Status API
 app.get('/api/status', (req, res) => {
     res.json({ connected: isConnected });
 });
 
-// Pairing Code Endpoint
 app.post('/api/pair', async (req, res) => {
-    const { phoneNumber, force } = req.body;
+    const { phoneNumber } = req.body;
     if (!phoneNumber) return res.status(400).json({ error: 'Phone number is required.' });
 
     const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
+    if (cleanNum.length < 10) return res.status(400).json({ error: 'Invalid phone number length.' });
 
     try {
-        if (force || !sock) {
-            await initWhatsApp(true);
-        }
+        // Force fresh initialization to wipe any stale/corrupted auth state
+        await initWhatsApp(true);
 
-        // Wait up to 5 seconds for socket setup
+        // Wait up to 10 seconds for the WS socket to bind
         let attempts = 0;
-        while ((!sock || !sock.ws) && attempts < 10) {
-            await new Promise(resolve => setTimeout(resolve, 500));
+        while ((!sock || !sock.ws || sock.ws.readyState !== 1) && attempts < 20) {
+            await new Promise(r => setTimeout(r, 500));
             attempts++;
         }
 
-        if (!sock) throw new Error('Socket initialization timed out');
+        if (!sock) {
+            return res.status(500).json({ error: 'Socket initialization timed out. Please retry.' });
+        }
+
+        // Delay 1.5s to let Baileys signal handshakes finish
+        await new Promise(r => setTimeout(r, 1500));
 
         const code = await sock.requestPairingCode(cleanNum);
-        res.json({ code, connected: false });
+        return res.json({ code, connected: false });
     } catch (err) {
-        console.error('Pairing Error:', err);
-        res.status(500).json({ error: 'Failed to request pairing code. Please retry.' });
+        console.error('Pairing Error Stack:', err);
+        return res.status(500).json({ error: err.message || 'Failed to request pairing code.' });
     }
 });
 
-// Grant VIP Access Endpoint
 app.post('/api/vip/grant', async (req, res) => {
     const { adminSecret, phoneNumber } = req.body;
 
@@ -123,7 +140,6 @@ app.post('/api/vip/grant', async (req, res) => {
     res.json({ success: true, message: `Granted VIP status to +${cleanNum}` });
 });
 
-// Broadcast Campaign Endpoint
 app.post('/api/campaign/send', async (req, res) => {
     if (!isConnected) {
         return res.status(400).json({ error: 'WhatsApp account not linked or session lost. Please link a device first.' });
@@ -163,9 +179,8 @@ app.post('/api/campaign/send', async (req, res) => {
                 await sock.sendMessage(jid, { text: parsedMsg });
                 console.log(`[${i + 1}/${phoneList.length}] Sent to ${phone}`);
 
-                // Apply anti-spam jitter delay
                 const jitter = Math.floor(Math.random() * 2000);
-                await new Promise(resolve => setTimeout(resolve, interval + jitter));
+                await new Promise(r => setTimeout(r, interval + jitter));
             } catch (err) {
                 console.error(`Failed to send to ${phone}:`, err);
             }
@@ -178,6 +193,5 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Manifest WA Engine running on port ${PORT}`);
-    initWhatsApp();
+    console.log(`Manifest WA Engine active on port ${PORT}`);
 });
