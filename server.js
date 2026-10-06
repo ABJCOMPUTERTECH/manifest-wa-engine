@@ -17,13 +17,16 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
+const ADMIN_KEY = process.env.ADMIN_KEY || "manifest_admin_2026";
 
 let sock = null;
 let isConnected = false;
-const vipUsers = new Set();
+let isInitializing = false;
+let db = null;
 
-async function useMongoAuthState(db) {
-    const collection = db.collection('baileys_auth');
+// --- MongoDB Auth Store ---
+async function useMongoAuthState(database) {
+    const collection = database.collection('baileys_auth');
 
     const writeData = async (data, id) => {
         await collection.updateOne(
@@ -75,82 +78,143 @@ async function useMongoAuthState(db) {
                 }
             }
         },
-        saveCreds: () => writeData(creds, 'creds')
+        saveCreds: () => writeData(creds, 'creds'),
+        clearSession: async () => {
+            await collection.deleteMany({});
+        }
     };
 }
 
-async function initWhatsApp() {
+// --- Initialize WhatsApp Socket ---
+async function initWhatsApp(forceReset = false) {
     if (!MONGO_URI) {
         console.error("CRITICAL: MONGO_URI environment variable is missing!");
         return;
     }
 
+    if (isInitializing) return;
+    isInitializing = true;
+
     try {
-        const client = new MongoClient(MONGO_URI);
-        await client.connect();
-        console.log("Connected to MongoDB Atlas successfully.");
-        
-        const db = client.db("whatsapp_saas");
-        const { state, saveCreds } = await useMongoAuthState(db);
+        if (!db) {
+            const client = new MongoClient(MONGO_URI);
+            await client.connect();
+            db = client.db("whatsapp_saas");
+            console.log("Connected to MongoDB Atlas.");
+        }
+
+        const authStore = await useMongoAuthState(db);
+
+        if (forceReset) {
+            console.log("Force resetting WhatsApp session...");
+            await authStore.clearSession();
+            isConnected = false;
+        }
+
         const { version } = await fetchLatestBaileysVersion();
 
         sock = makeWASocket({
             version,
-            auth: state,
-            printQRInTerminal: false
+            auth: authStore.state,
+            printQRInTerminal: false,
+            browser: ["Manifest WA Engine", "Chrome", "1.0.0"]
         });
 
-        sock.ev.on('creds.update', saveCreds);
+        sock.ev.on('creds.update', authStore.saveCreds);
 
-        sock.ev.on('connection.update', (update) => {
+        sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
+
             if (connection === 'open') {
                 isConnected = true;
-                console.log("WhatsApp Engine Connected & Ready!");
+                isInitializing = false;
+                console.log("WhatsApp Connection Active!");
             } else if (connection === 'close') {
                 isConnected = false;
-                const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log(`Connection closed. Reconnecting: ${shouldReconnect}`);
-                if (shouldReconnect) {
-                    setTimeout(initWhatsApp, 5000);
+                isInitializing = false;
+                const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+                console.log(`Connection closed (Reason code: ${statusCode}). Reconnecting: ${shouldReconnect}`);
+
+                if (statusCode === DisconnectReason.loggedOut) {
+                    console.log("Session logged out by user. Clearing database session...");
+                    await authStore.clearSession();
+                } else if (shouldReconnect) {
+                    setTimeout(() => initWhatsApp(), 5000);
                 }
             }
         });
     } catch (err) {
+        isInitializing = false;
         console.error("Initialization Error:", err);
     }
 }
 
+// --- API Endpoints ---
+
 app.get('/api/status', (req, res) => {
-    res.json({ connected: isConnected });
+    res.json({
+        connected: isConnected,
+        statusText: isConnected ? "CONNECTED" : "DISCONNECTED",
+        userJid: sock?.user?.id || null
+    });
 });
 
 app.post('/api/pair', async (req, res) => {
-    const { phoneNumber } = req.body;
+    const { phoneNumber, force } = req.body;
     if (!phoneNumber) return res.status(400).json({ error: "Phone number is required." });
-    if (isConnected) return res.json({ message: "Device already linked and active" });
+
+    const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
 
     try {
-        if (!sock) await initWhatsApp();
-        setTimeout(async () => {
-            const code = await sock.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
-            res.json({ code });
-        }, 3000);
+        if (force || !sock) {
+            await initWhatsApp(force);
+        }
+
+        if (isConnected && !force) {
+            return res.json({ connected: true, message: "Device is already linked and active." });
+        }
+
+        let attempts = 0;
+        while ((!sock || !sock.ws) && attempts < 10) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            attempts++;
+        }
+
+        const code = await sock.requestPairingCode(cleanNum);
+        res.json({ code, connected: false });
     } catch (err) {
-        res.status(500).json({ error: "Failed to request pairing code." });
+        console.error("Pairing Error:", err);
+        res.status(500).json({ error: "Failed to request pairing code. Please retry." });
     }
 });
 
-app.post('/api/vip/grant', (req, res) => {
-    const { phoneNumber } = req.body;
-    if (!phoneNumber) return res.status(400).json({ error: "Phone number required." });
-    vipUsers.add(phoneNumber.trim());
-    res.json({ message: `Granted VIP access to ${phoneNumber}` });
+app.post('/api/vip/grant', async (req, res) => {
+    const { phoneNumber, adminSecret } = req.body;
+
+    if (!adminSecret || adminSecret !== ADMIN_KEY) {
+        return res.status(401).json({ error: "Unauthorized: Invalid Admin Secret Key." });
+    }
+
+    if (!phoneNumber) return res.status(400).json({ error: "Phone number is required." });
+
+    const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
+
+    if (db) {
+        await db.collection("vip_users").updateOne(
+            { _id: cleanNum },
+            { $set: { vip: true, grantedAt: new Date() } },
+            { upsert: true }
+        );
+    }
+
+    res.json({ success: true, message: `Granted VIP status to +${cleanNum}` });
 });
 
 app.post('/api/campaign/send', async (req, res) => {
     if (!isConnected) {
-        return res.status(400).json({ error: "WhatsApp account not linked or session lost." });
+        return res.status(400).json({ error: "WhatsApp account not linked or session lost. Please link a device first." });
     }
 
     const { recipients, message } = req.body;
@@ -159,7 +223,11 @@ app.post('/api/campaign/send', async (req, res) => {
     }
 
     const phoneList = recipients.split(',').map(p => p.trim().replace(/[^0-9]/g, '')).filter(Boolean);
-    
+
+    if (phoneList.length === 0) {
+        return res.status(400).json({ error: "No valid recipient numbers provided." });
+    }
+
     const parseSpintax = (text) => {
         return text.replace(/\{([^{}]+)\}/g, (match, choices) => {
             const options = choices.split('|');
@@ -167,28 +235,32 @@ app.post('/api/campaign/send', async (req, res) => {
         });
     };
 
-    res.json({ message: `Campaign initiated for ${phoneList.length} contacts.` });
+    res.json({ success: true, message: `Campaign initiated for ${phoneList.length} recipient(s).` });
 
-    for (const phone of phoneList) {
-        try {
-            const parsedMsg = parseSpintax(message);
-            const jid = `${phone}@s.whatsapp.net`;
-            await sock.sendMessage(jid, { text: parsedMsg });
-            console.log(`Sent to ${phone}`);
-            
-            const delay = Math.floor(Math.random() * 4000) + 4000;
-            await new Promise(resolve => setTimeout(resolve, delay));
-        } catch (err) {
-            console.error(`Failed to send to ${phone}:`, err);
+    (async () => {
+        for (let i = 0; i < phoneList.length; i++) {
+            const phone = phoneList[i];
+            try {
+                const parsedMsg = parseSpintax(message);
+                const jid = `${phone}@s.whatsapp.net`;
+                await sock.sendMessage(jid, { text: parsedMsg });
+                console.log(`[${i + 1}/${phoneList.length}] Sent to ${phone}`);
+
+                const delay = Math.floor(Math.random() * 4000) + 4000;
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } catch (err) {
+                console.error(`Failed to send to ${phone}:`, err);
+            }
         }
-    }
+    })();
 });
 
-app.get('*', (req, res) => {
+// Fallback Route for Single Page App
+app.use((req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Manifest WA Engine running on port ${PORT}`);
     initWhatsApp();
 });
