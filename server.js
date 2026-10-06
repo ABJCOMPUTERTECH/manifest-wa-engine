@@ -5,16 +5,12 @@ const path = require('path');
 const fs = require('fs');
 const { MongoClient } = require('mongodb');
 
-// Prevent global uncaught errors from crashing the Node process
-process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err);
-});
-process.on('unhandledRejection', (err) => {
-    console.error('Unhandled Rejection:', err);
-});
+process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
+process.on('unhandledRejection', (err) => console.error('Unhandled Rejection:', err));
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
@@ -46,21 +42,9 @@ function cleanAuthFolder() {
     }
 }
 
-async function initWhatsApp(forceClean = false) {
+async function startWhatsAppSocket() {
     if (isInitializing) return;
     isInitializing = true;
-
-    if (forceClean) {
-        if (sock) {
-            try {
-                sock.ev.removeAllListeners();
-                sock.end(undefined);
-            } catch (e) {}
-            sock = null;
-        }
-        cleanAuthFolder();
-        isConnected = false;
-    }
 
     const authPath = path.join(__dirname, 'auth_info_baileys');
 
@@ -72,7 +56,7 @@ async function initWhatsApp(forceClean = false) {
             const fetched = await fetchLatestBaileysVersion();
             version = fetched.version;
         } catch (vErr) {
-            console.warn('Could not fetch latest version, proceeding with default.');
+            console.warn('Could not fetch latest Baileys version, using default fallback.');
         }
 
         sock = makeWASocket({
@@ -97,15 +81,17 @@ async function initWhatsApp(forceClean = false) {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 
                 if (statusCode === disconnectReason.loggedOut) {
-                    console.log('Device logged out. Wiping session.');
+                    console.log('Logged out from WhatsApp. Wiping session.');
                     cleanAuthFolder();
+                    setTimeout(() => startWhatsAppSocket(), 2000);
                 } else {
-                    setTimeout(() => initWhatsApp(false), 3000);
+                    console.log('Connection closed. Reconnecting...');
+                    setTimeout(() => startWhatsAppSocket(), 3000);
                 }
             } else if (connection === 'open') {
                 isConnected = true;
                 isInitializing = false;
-                console.log('✅ WhatsApp connection active!');
+                console.log('✅ WhatsApp connection active and ready!');
             }
         });
     } catch (e) {
@@ -126,24 +112,26 @@ app.post('/api/pair', async (req, res) => {
     const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
     if (cleanNum.length < 10) return res.status(400).json({ error: 'Invalid phone number format.' });
 
+    if (isConnected) {
+        return res.json({ connected: true, message: 'Device is already connected.' });
+    }
+
     try {
-        if (isConnected) {
-            return res.json({ connected: true, message: 'Device is already connected.' });
+        // Ensure background socket exists
+        if (!sock || !sock.ws) {
+            startWhatsAppSocket();
         }
 
-        await initWhatsApp(true);
-
+        // Wait up to 15s for WS readyState
         let attempts = 0;
-        while ((!sock || !sock.ws || sock.ws.readyState !== 1) && attempts < 50) {
+        while ((!sock || !sock.ws || sock.ws.readyState !== 1) && attempts < 30) {
             await new Promise(r => setTimeout(r, 500));
             attempts++;
         }
 
         if (!sock || !sock.ws || sock.ws.readyState !== 1) {
-            return res.status(500).json({ error: 'WhatsApp connection timeout. Please tap Request Pairing Code again.' });
+            return res.status(500).json({ error: 'WhatsApp service initializing. Please tap Request Pairing Code again in 5 seconds.' });
         }
-
-        await new Promise(r => setTimeout(r, 2000));
 
         const code = await sock.requestPairingCode(cleanNum);
         return res.json({ code, connected: false });
@@ -156,7 +144,7 @@ app.post('/api/pair', async (req, res) => {
 app.post('/api/vip/grant', async (req, res) => {
     const { adminSecret, phoneNumber } = req.body;
 
-    if (!adminSecret || adminSecret !== ADMIN_KEY) {
+    if (!adminSecret || adminSecret.trim() !== ADMIN_KEY.trim()) {
         return res.status(401).json({ error: 'Unauthorized: Invalid Admin Secret Key.' });
     }
 
@@ -165,12 +153,16 @@ app.post('/api/vip/grant', async (req, res) => {
     const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
 
     if (db) {
-        await db.collection('vip_users').updateOne(
-            { _id: cleanNum },
-            { $set: { vip: true, grantedAt: new Date() } },
-            { upsert: true }
-        );
-        return res.json({ success: true, message: `Granted VIP status to +${cleanNum}` });
+        try {
+            await db.collection('vip_users').updateOne(
+                { _id: cleanNum },
+                { $set: { vip: true, grantedAt: new Date() } },
+                { upsert: true }
+            );
+            return res.json({ success: true, message: `Granted VIP status to +${cleanNum}` });
+        } catch (dbErr) {
+            return res.status(500).json({ error: 'Database update failed.' });
+        }
     }
 
     res.json({ success: true, message: `VIP set locally for +${cleanNum} (MongoDB not connected)` });
@@ -186,10 +178,12 @@ app.post('/api/campaign/send', async (req, res) => {
         return res.status(400).json({ error: 'Recipients and message body are required.' });
     }
 
-    const rawList = Array.isArray(recipients) ? recipients : recipients.split(/[\n,]+/);
-    const phoneList = rawList
-        .map(p => String(p).trim().replace(/[^0-9]/g, ''))
-        .filter(Boolean);
+    const rawList = Array.isArray(recipients) ? recipients : String(recipients).split(/[\n,\r]+/);
+    const phoneList = Array.from(new Set(
+        rawList
+            .map(p => String(p).trim().replace(/[^0-9]/g, ''))
+            .filter(p => p.length >= 10)
+    ));
 
     if (phoneList.length === 0) {
         return res.status(400).json({ error: 'No valid recipient numbers provided.' });
@@ -230,5 +224,5 @@ app.use((req, res) => {
 
 app.listen(PORT, () => {
     console.log(`Manifest WA Engine active on port ${PORT}`);
-    initWhatsApp(false);
+    startWhatsAppSocket();
 });
