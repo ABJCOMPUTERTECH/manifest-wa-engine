@@ -15,8 +15,8 @@ const MONGO_URI = process.env.MONGO_URI;
 
 let sock = null;
 let isConnected = false;
-let isInitializing = false;
 let db = null;
+let currentPairingPhone = null;
 
 if (MONGO_URI) {
     MongoClient.connect(MONGO_URI)
@@ -27,19 +27,21 @@ if (MONGO_URI) {
         .catch(err => console.error('MongoDB Error:', err));
 }
 
-async function initWhatsApp(forceClean = false) {
-    if (isInitializing) return;
-    isInitializing = true;
-
+async function initWhatsApp(cleanSession = false) {
     const authPath = path.join(__dirname, 'auth_info_baileys');
 
-    if (forceClean) {
+    if (cleanSession) {
         if (sock) {
-            try { sock.ev.removeAllListeners(); sock.end(undefined); } catch (e) {}
+            try {
+                sock.ev.removeAllListeners();
+                sock.end(undefined);
+            } catch (e) {}
             sock = null;
         }
         if (fs.existsSync(authPath)) {
-            try { fs.rmSync(authPath, { recursive: true, force: true }); } catch (e) {}
+            try {
+                fs.rmSync(authPath, { recursive: true, force: true });
+            } catch (e) {}
         }
         isConnected = false;
     }
@@ -50,34 +52,36 @@ async function initWhatsApp(forceClean = false) {
 
         sock = makeWASocket({
             version,
-            logger: pino({ level: 'fatal' }),
+            logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
             auth: state,
-            browser: ["Ubuntu", "Chrome", "20.0.04"]
+            // Official browser identifier required for web client pairing
+            browser: ["Chrome (Linux)", "Chrome", "110.0.5481.177"]
         });
 
         sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect } = update;
+
             if (connection === 'close') {
                 isConnected = false;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
+                
+                // Do NOT wipe auth files during connection reconnect loops
                 if (statusCode !== disconnectReason.loggedOut) {
-                    setTimeout(() => { isInitializing = false; initWhatsApp(false); }, 3000);
+                    setTimeout(() => initWhatsApp(false), 3000);
                 } else {
-                    isInitializing = false;
+                    console.log('Logged out. Session cleared.');
+                    initWhatsApp(true);
                 }
             } else if (connection === 'open') {
                 isConnected = true;
-                isInitializing = false;
-                console.log('WhatsApp connection active!');
+                console.log('✅ WhatsApp device connected successfully!');
             }
         });
     } catch (e) {
-        console.error('Init Error:', e);
-    } finally {
-        isInitializing = false;
+        console.error('Socket Init Error:', e);
     }
 }
 
@@ -93,27 +97,34 @@ app.post('/api/pair', async (req, res) => {
     if (cleanNum.length < 10) return res.status(400).json({ error: 'Invalid phone number length.' });
 
     try {
-        // Force fresh initialization to wipe any stale/corrupted auth state
-        await initWhatsApp(true);
+        // If device is already connected, no need to pair again
+        if (isConnected) {
+            return res.json({ connected: true, message: 'Device is already linked and active.' });
+        }
 
-        // Wait up to 10 seconds for the WS socket to bind
+        // Initialize fresh socket if null or disconnected, but keep state for key exchange
+        if (!sock || !sock.ws || sock.ws.readyState !== 1) {
+            await initWhatsApp(true);
+        }
+
+        // Wait for socket open state
         let attempts = 0;
-        while ((!sock || !sock.ws || sock.ws.readyState !== 1) && attempts < 20) {
+        while ((!sock || !sock.ws || sock.ws.readyState !== 1) && attempts < 15) {
             await new Promise(r => setTimeout(r, 500));
             attempts++;
         }
 
-        if (!sock) {
-            return res.status(500).json({ error: 'Socket initialization timed out. Please retry.' });
+        if (!sock || sock.ws.readyState !== 1) {
+            return res.status(500).json({ error: 'Connection to WhatsApp servers timed out. Please try again.' });
         }
 
-        // Delay 1.5s to let Baileys signal handshakes finish
-        await new Promise(r => setTimeout(r, 1500));
+        // Small delay to allow handshake readiness
+        await new Promise(r => setTimeout(r, 1000));
 
         const code = await sock.requestPairingCode(cleanNum);
         return res.json({ code, connected: false });
     } catch (err) {
-        console.error('Pairing Error Stack:', err);
+        console.error('Pairing Code Request Error:', err);
         return res.status(500).json({ error: err.message || 'Failed to request pairing code.' });
     }
 });
@@ -194,4 +205,5 @@ app.use((req, res) => {
 
 app.listen(PORT, () => {
     console.log(`Manifest WA Engine active on port ${PORT}`);
+    initWhatsApp(false);
 });
