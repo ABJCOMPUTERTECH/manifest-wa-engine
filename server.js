@@ -1,9 +1,17 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, disconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, disconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
 const { MongoClient } = require('mongodb');
+
+// Prevent global uncaught errors from crashing the Node process
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (err) => {
+    console.error('Unhandled Rejection:', err);
+});
 
 const app = express();
 app.use(express.json());
@@ -58,10 +66,17 @@ async function initWhatsApp(forceClean = false) {
 
     try {
         const { state, saveCreds } = await useMultiFileAuthState(authPath);
+        
+        let version;
+        try {
+            const fetched = await fetchLatestBaileysVersion();
+            version = fetched.version;
+        } catch (vErr) {
+            console.warn('Could not fetch latest version, proceeding with default.');
+        }
 
         sock = makeWASocket({
-            // Stable version array to bypass external fetch delays on Render
-            version: [2, 3000, 1015901307],
+            ...(version ? { version } : {}),
             logger: pino({ level: 'fatal' }),
             printQRInTerminal: false,
             auth: state,
@@ -95,6 +110,7 @@ async function initWhatsApp(forceClean = false) {
         });
     } catch (e) {
         console.error('Socket Init Error:', e);
+    } finally {
         isInitializing = false;
     }
 }
@@ -115,10 +131,8 @@ app.post('/api/pair', async (req, res) => {
             return res.json({ connected: true, message: 'Device is already connected.' });
         }
 
-        // Force a fresh session initialization for new pairing attempts
         await initWhatsApp(true);
 
-        // Wait up to 25 seconds for WebSocket connection state
         let attempts = 0;
         while ((!sock || !sock.ws || sock.ws.readyState !== 1) && attempts < 50) {
             await new Promise(r => setTimeout(r, 500));
@@ -129,7 +143,6 @@ app.post('/api/pair', async (req, res) => {
             return res.status(500).json({ error: 'WhatsApp connection timeout. Please tap Request Pairing Code again.' });
         }
 
-        // Delay to allow WebSocket handshake completion
         await new Promise(r => setTimeout(r, 2000));
 
         const code = await sock.requestPairingCode(cleanNum);
