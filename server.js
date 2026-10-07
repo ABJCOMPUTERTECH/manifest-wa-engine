@@ -14,7 +14,6 @@ app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
-const ADMIN_KEY = process.env.ADMIN_KEY || 'supersecretkey';
 const MONGO_URI = process.env.MONGO_URI;
 
 const sessions = new Map();
@@ -119,9 +118,11 @@ async function useMongoAuthState(database, tenantId) {
     };
 }
 
-async function getOrCreateSession(tenantId) {
+async function createFreshSession(tenantId) {
     if (sessions.has(tenantId)) {
-        return sessions.get(tenantId);
+        const old = sessions.get(tenantId);
+        try { old.sock.ev.removeAllListeners(); } catch (e) {}
+        sessions.delete(tenantId);
     }
 
     const activeDb = await getDb();
@@ -142,36 +143,23 @@ async function getOrCreateSession(tenantId) {
         };
     }
 
-    let version;
-    try {
-        const fetched = await fetchLatestBaileysVersion();
-        version = fetched.version;
-    } catch (e) {}
+    // Force fetch latest WhatsApp Web protocol version
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`Using WA Web Version: ${version.join('.')} (isLatest: ${isLatest})`);
 
     const sock = makeWASocket({
-        ...(version ? { version } : {}),
+        version,
         logger: pino({ level: 'fatal' }),
         printQRInTerminal: false,
         auth: state,
-        browser: Browsers.ubuntu("Chrome"),
+        browser: ["Ubuntu", "Chrome", "20.0.04"],
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
         syncFullHistory: false
     });
 
-    const sessionData = { sock, isConnected: false, readyPromise: null, clearSession };
-
-    sessionData.readyPromise = new Promise((resolve) => {
-        const handler = (update) => {
-            if (update.qr || update.connection === 'open' || update.connection === 'connecting') {
-                sock.ev.off('connection.update', handler);
-                resolve();
-            }
-        };
-        sock.ev.on('connection.update', handler);
-        setTimeout(resolve, 30000);
-    });
+    const sessionData = { sock, isConnected: false, clearSession };
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -183,11 +171,6 @@ async function getOrCreateSession(tenantId) {
             if (statusCode === disconnectReason.loggedOut) {
                 await clearSession();
                 sessions.delete(tenantId);
-            } else {
-                setTimeout(() => {
-                    sessions.delete(tenantId);
-                    getOrCreateSession(tenantId);
-                }, 3000);
             }
         } else if (connection === 'open') {
             sessionData.isConnected = true;
@@ -216,67 +199,26 @@ app.post('/api/pair', async (req, res) => {
 
     try {
         let session = sessions.get(cleanNum);
-        if (!session) {
-            session = await getOrCreateSession(cleanNum);
+        
+        // If not connected, rebuild session fresh to clear socket state
+        if (!session || !session.isConnected) {
+            session = await createFreshSession(cleanNum);
         }
 
         if (session.isConnected) {
             return res.json({ connected: true, message: 'Device is already connected.' });
         }
 
-        await session.readyPromise;
-        await new Promise(r => setTimeout(r, 2000));
+        // Delay slightly for socket handshake
+        await new Promise(r => setTimeout(r, 3000));
 
         const code = await session.sock.requestPairingCode(cleanNum);
         return res.json({ code, connected: false, tenantId: cleanNum });
     } catch (err) {
         console.error(`Pairing error for ${cleanNum}:`, err);
         sessions.delete(cleanNum);
-        return res.status(500).json({ error: err.message || 'Failed to generate pairing code. Please try again.' });
+        return res.status(500).json({ error: err.message || 'Failed to generate pairing code.' });
     }
-});
-
-app.post('/api/campaign/send', async (req, res) => {
-    const { senderNumber, recipients, message, delay } = req.body;
-    if (!senderNumber) return res.status(400).json({ error: 'senderNumber is required.' });
-
-    const tenantId = senderNumber.replace(/[^0-9]/g, '');
-    const session = sessions.get(tenantId);
-
-    if (!session || !session.isConnected) {
-        return res.status(400).json({ error: `WhatsApp account +${tenantId} is not linked.` });
-    }
-
-    if (!recipients || !message) return res.status(400).json({ error: 'Recipients and message body required.' });
-
-    const rawList = Array.isArray(recipients) ? recipients : String(recipients).split(/[\n,\r]+/);
-    const phoneList = Array.from(new Set(
-        rawList.map(p => String(p).trim().replace(/[^0-9]/g, '')).filter(p => p.length >= 10)
-    ));
-
-    if (phoneList.length === 0) return res.status(400).json({ error: 'No valid recipient numbers.' });
-
-    const interval = parseInt(delay) || 15000;
-    const parseSpintax = (text) => text.replace(/\{([^{}]+)\}/g, (_, choices) => {
-        const options = choices.split('|');
-        return options[Math.floor(Math.random() * options.length)];
-    });
-
-    res.json({ success: true, message: `Campaign initiated for ${phoneList.length} recipient(s) via +${tenantId}.` });
-
-    (async () => {
-        for (let i = 0; i < phoneList.length; i++) {
-            const phone = phoneList[i];
-            try {
-                const parsedMsg = parseSpintax(message);
-                await session.sock.sendMessage(`${phone}@s.whatsapp.net`, { text: parsedMsg });
-                console.log(`[Tenant +${tenantId}] Sent to ${phone}`);
-                await new Promise(r => setTimeout(r, interval + Math.floor(Math.random() * 2000)));
-            } catch (err) {
-                console.error(`[Tenant +${tenantId}] Send error ${phone}:`, err);
-            }
-        }
-    })();
 });
 
 app.use((req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
