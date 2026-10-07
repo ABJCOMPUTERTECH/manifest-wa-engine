@@ -143,12 +143,11 @@ async function createFreshSession(tenantId) {
         };
     }
 
-    // Always fetch latest Baileys version signature
     let version = [2, 3000, 1015901307];
     try {
         const fetched = await fetchLatestBaileysVersion();
         version = fetched.version;
-        console.log(`Using WA Version: ${version.join('.')}`);
+        console.log(`Using Dynamic WA Web Version: ${version.join('.')}`);
     } catch (e) {}
 
     const sock = makeWASocket({
@@ -159,7 +158,7 @@ async function createFreshSession(tenantId) {
         browser: Browsers.macOS("Chrome"),
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 60000,
-        keepAliveIntervalMs: 10000,
+        keepAliveIntervalMs: 15000,
         syncFullHistory: false
     });
 
@@ -178,7 +177,7 @@ async function createFreshSession(tenantId) {
             }
         } else if (connection === 'open') {
             sessionData.isConnected = true;
-            console.log(`✅ Tenant [${tenantId}] Connected!`);
+            console.log(`✅ Tenant [${tenantId}] Connected Successfully!`);
         }
     });
 
@@ -211,10 +210,12 @@ app.post('/api/pair', async (req, res) => {
             return res.json({ connected: true, message: 'Device is already connected.' });
         }
 
-        // Wait 4 seconds for socket initialization before requesting code
-        await new Promise(r => setTimeout(r, 4000));
+        // Wait 6 seconds for noise socket setup before issuing pairing request
+        console.log(`[${cleanNum}] Initializing socket handshake...`);
+        await new Promise(r => setTimeout(r, 6000));
 
         const code = await session.sock.requestPairingCode(cleanNum);
+        console.log(`[${cleanNum}] Pairing code generated successfully: ${code}`);
         return res.json({ code, connected: false, tenantId: cleanNum });
     } catch (err) {
         console.error(`Pairing error for ${cleanNum}:`, err);
