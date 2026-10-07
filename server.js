@@ -143,16 +143,20 @@ async function createFreshSession(tenantId) {
         };
     }
 
-    // Force fetch latest WhatsApp Web protocol version
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`Using WA Web Version: ${version.join('.')} (isLatest: ${isLatest})`);
+    // Always fetch latest Baileys version signature
+    let version = [2, 3000, 1015901307];
+    try {
+        const fetched = await fetchLatestBaileysVersion();
+        version = fetched.version;
+        console.log(`Using WA Version: ${version.join('.')}`);
+    } catch (e) {}
 
     const sock = makeWASocket({
         version,
         logger: pino({ level: 'fatal' }),
         printQRInTerminal: false,
         auth: state,
-        browser: ["Ubuntu", "Chrome", "20.0.04"],
+        browser: Browsers.macOS("Chrome"),
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
@@ -174,7 +178,7 @@ async function createFreshSession(tenantId) {
             }
         } else if (connection === 'open') {
             sessionData.isConnected = true;
-            console.log(`✅ Tenant [${tenantId}] Active!`);
+            console.log(`✅ Tenant [${tenantId}] Connected!`);
         }
     });
 
@@ -199,8 +203,6 @@ app.post('/api/pair', async (req, res) => {
 
     try {
         let session = sessions.get(cleanNum);
-        
-        // If not connected, rebuild session fresh to clear socket state
         if (!session || !session.isConnected) {
             session = await createFreshSession(cleanNum);
         }
@@ -209,8 +211,8 @@ app.post('/api/pair', async (req, res) => {
             return res.json({ connected: true, message: 'Device is already connected.' });
         }
 
-        // Delay slightly for socket handshake
-        await new Promise(r => setTimeout(r, 3000));
+        // Wait 4 seconds for socket initialization before requesting code
+        await new Promise(r => setTimeout(r, 4000));
 
         const code = await session.sock.requestPairingCode(cleanNum);
         return res.json({ code, connected: false, tenantId: cleanNum });
