@@ -1,5 +1,5 @@
 const express = require('express');
-const { default: makeWASocket, disconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, disconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON, useMultiFileAuthState, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
@@ -153,10 +153,10 @@ async function getOrCreateSession(tenantId) {
         logger: pino({ level: 'fatal' }),
         printQRInTerminal: false,
         auth: state,
-        browser: ["Ubuntu", "Chrome", "20.0.04"],
-        connectTimeoutMs: 120000,
-        defaultQueryTimeoutMs: 120000,
-        keepAliveIntervalMs: 25000,
+        browser: Browsers.ubuntu("Chrome"),
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000,
         syncFullHistory: false
     });
 
@@ -164,13 +164,13 @@ async function getOrCreateSession(tenantId) {
 
     sessionData.readyPromise = new Promise((resolve) => {
         const handler = (update) => {
-            if (update.qr || update.connection === 'open') {
+            if (update.qr || update.connection === 'open' || update.connection === 'connecting') {
                 sock.ev.off('connection.update', handler);
                 resolve();
             }
         };
         sock.ev.on('connection.update', handler);
-        setTimeout(resolve, 60000);
+        setTimeout(resolve, 30000);
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -187,7 +187,7 @@ async function getOrCreateSession(tenantId) {
                 setTimeout(() => {
                     sessions.delete(tenantId);
                     getOrCreateSession(tenantId);
-                }, 5000);
+                }, 3000);
             }
         } else if (connection === 'open') {
             sessionData.isConnected = true;
@@ -215,19 +215,24 @@ app.post('/api/pair', async (req, res) => {
     if (cleanNum.length < 10) return res.status(400).json({ error: 'Invalid phone number format.' });
 
     try {
-        const session = await getOrCreateSession(cleanNum);
+        let session = sessions.get(cleanNum);
+        if (!session) {
+            session = await getOrCreateSession(cleanNum);
+        }
 
         if (session.isConnected) {
             return res.json({ connected: true, message: 'Device is already connected.' });
         }
 
         await session.readyPromise;
+        await new Promise(r => setTimeout(r, 2000));
 
         const code = await session.sock.requestPairingCode(cleanNum);
         return res.json({ code, connected: false, tenantId: cleanNum });
     } catch (err) {
         console.error(`Pairing error for ${cleanNum}:`, err);
-        return res.status(500).json({ error: err.message || 'Failed to generate pairing code.' });
+        sessions.delete(cleanNum);
+        return res.status(500).json({ error: err.message || 'Failed to generate pairing code. Please try again.' });
     }
 });
 
